@@ -1,0 +1,107 @@
+name: Migrate Canary Releases with Auto Changelog
+
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Debug Secrets
+        run: |
+          if [[ -z "${{ secrets.RELEASE_TOKEN }}" ]]; then
+            echo "❌ RELEASE_TOKEN is missing!"
+            exit 1
+          else
+            echo "✅ RELEASE_TOKEN is set."
+          fi
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt update
+          sudo apt install -y gh
+
+      - name: Authenticate GitHub CLI
+        run: echo "${{ secrets.RELEASE_TOKEN }}" | gh auth login --with-token
+
+      - name: Check GitHub API Rate Limits
+        run: gh api rate_limit
+
+      - name: Fetch and Migrate Releases from Both Sources
+        run: |
+          set -e
+          DEST_REPO="ADEMOLA200/Ryujinx-Canary-Builds"  # Updated destination repository
+          SOURCES=("Ryubing/Canary-Releases" "Goodfeat/Ruy-Nightly-Canary")
+
+          for SOURCE_REPO in "${SOURCES[@]}"; do
+            echo "Processing source repository: $SOURCE_REPO"
+
+            REPO_DIR=$(echo "$SOURCE_REPO" | tr '/' '-')
+            git clone "https://github.com/$SOURCE_REPO.git" "$REPO_DIR"
+            cd "$REPO_DIR"
+            git fetch --tags
+            cd ..
+
+            SOURCE_TAGS=$(gh api --paginate "/repos/$SOURCE_REPO/releases" --jq '.[].tag_name')
+            if [ -z "$SOURCE_TAGS" ]; then
+              echo "❌ No releases found in $SOURCE_REPO!"
+              continue
+            fi
+            echo "Found releases:"
+            echo "$SOURCE_TAGS"
+
+            for TAG in $SOURCE_TAGS; do
+              echo "🚀 Processing $TAG from $SOURCE_REPO"
+              if gh release view "$TAG" -R "$DEST_REPO" >/dev/null 2>&1; then
+                echo "⏭️ $TAG exists. Skipping..."
+                continue
+              fi
+
+              cd "$REPO_DIR"
+              if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+                CHANGELOG_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
+              else
+                PREV_TAG=$(git tag --sort=-v:refname | awk "/^$TAG\$/{found=1; next} found{print; exit}")
+                if [ -z "$PREV_TAG" ]; then
+                  CHANGELOG_URL="https://github.com/$SOURCE_REPO/releases/tag/$TAG"
+                else
+                  CHANGELOG_URL="https://github.com/$SOURCE_REPO/compare/$PREV_TAG...$TAG"
+                fi
+              fi
+              cd ..
+
+              DESCRIPTION="## Canary builds:
+
+            These builds are experimental and may sometimes not work, use [regular builds](https://github.com/Ryujinx/release-channel-master/releases) instead if that sounds like something you don't want to deal with.
+
+            | Platform           | Artifact                     |
+            |--------------------|------------------------------|
+            | Windows 64-bit     | Canary Windows Artifact      |
+            | Windows ARM 64-bit | Canary Windows ARM Artifact  |
+            | Linux 64-bit       | Canary Linux Artifact        |
+            | Linux ARM 64-bit   | Canary Linux Artifact        |
+            | macOS              | Canary macOS Artifact        |
+
+            **Changelog:** ${CHANGELOG_URL}
+            "
+              DESCRIPTION_CLEANED=$(echo "$DESCRIPTION" | sed 's/^ *//g')
+
+              gh release create "$TAG" -R "$DEST_REPO" --title "$TAG" --notes "$DESCRIPTION_CLEANED"
+
+              ASSET_URLS=$(gh release view "$TAG" -R "$SOURCE_REPO" --json assets -q '.assets[].url')
+              for URL in $ASSET_URLS; do
+                FILENAME=$(basename "$URL")
+                echo "📥 Downloading $FILENAME..."
+                curl -L -o "$FILENAME" "$URL"
+                echo "📤 Uploading $FILENAME..."
+                gh release upload "$TAG" -R "$DEST_REPO" "$FILENAME" || echo "⚠️ Failed to upload $FILENAME"
+                rm -f "$FILENAME"
+              done
+              echo "✅ Migrated $TAG from $SOURCE_REPO!"
+              sleep 1
+            done
+          done
+        working-directory: ${{ github.workspace }}
